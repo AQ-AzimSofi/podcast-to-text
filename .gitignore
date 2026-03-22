@@ -2,5 +2,7 @@
 *.mp3
 *.m4a
 *.wav
+*.srt
+*.txt
 __pycache__/
 *.pyc
