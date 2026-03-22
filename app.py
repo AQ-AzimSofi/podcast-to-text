@@ -7,27 +7,30 @@ import requests
 import xml.etree.ElementTree as ET
 import re
 import os
-import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-SEGMENT_MINUTES = 10
-
 load_dotenv()
 
+DEFAULT_BATCH_MIN = 10
+
+
 def get_api_keys():
-    keys = []
-    for i in range(1, 5):
+    free = []
+    for i in range(1, 10):
         k = os.getenv(f"GEMINI_API_KEY_{i}", "").strip()
         if k:
-            keys.append(k)
-    paid = os.getenv("GEMINI_API_KEY_PAID", "").strip()
-    if paid:
-        keys.append(paid)
-    return keys
+            free.append(k)
+    paid = os.getenv("GEMINI_API_KEY_PAID", "").strip() or None
+    return free, paid
 
+
+# ---------------------------------------------------------------------------
+# Podcast download
+# ---------------------------------------------------------------------------
 
 def resolve_podcast_audio(apple_url):
     match = re.search(r"/id(\d+)", apple_url)
@@ -59,20 +62,17 @@ def resolve_podcast_audio(apple_url):
             enc = item.find("enclosure")
             if enc is not None:
                 ep_url_candidates.append(enc.get("url", ""))
-
             ep_match = any(episode_id in c for c in [guid] + ep_url_candidates)
             if not ep_match:
                 itunes_ep = item.find("itunes:episode", ns)
                 if itunes_ep is not None and itunes_ep.text:
                     pass
-
             if enc is not None:
                 audio_url = enc.get("url")
                 if episode_id and not ep_match:
                     continue
                 title = item.findtext("title", "episode")
                 return audio_url, title
-
         else:
             enc = item.find("enclosure")
             if enc is not None:
@@ -112,6 +112,36 @@ def download_audio(url, dest_path, progress_cb=None):
                 progress_cb(downloaded / total)
 
 
+# ---------------------------------------------------------------------------
+# Audio helpers
+# ---------------------------------------------------------------------------
+
+def get_audio_duration(audio_path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+        capture_output=True, text=True,
+    )
+    return float(result.stdout.strip())
+
+
+def split_audio_segment(audio_path, start_min, end_min):
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+    tmp.close()
+    cmd = [
+        "ffmpeg", "-y", "-i", audio_path,
+        "-ss", str(start_min * 60),
+        "-to", str(end_min * 60),
+        "-c", "copy", tmp.name,
+    ]
+    subprocess.run(cmd, capture_output=True, check=True)
+    return tmp.name
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
 PROMPT_TEXT = (
     "この音声を日本語で文字起こししてください。"
     "話者が複数いる場合は話者を区別してください。"
@@ -137,10 +167,12 @@ PROMPT_SRT = (
 )
 
 
+# ---------------------------------------------------------------------------
+# SRT post-processing
+# ---------------------------------------------------------------------------
+
 def _normalize_ts(ts):
     ts = ts.strip()
-
-    # Split on comma or dot to separate fractional part
     if "," in ts:
         time_part, frac = ts.rsplit(",", 1)
     elif "." in ts:
@@ -152,17 +184,13 @@ def _normalize_ts(ts):
     segs = time_part.split(":")
 
     if len(segs) == 2:
-        # Could be MM:SS or HH:MM — check if second value > 59 means it's not seconds
         a, b = int(segs[0]), int(segs[1])
-        # MM:SS format (missing HH:)
         h, m, s = 0, a, b
     elif len(segs) == 3:
         h, m, s = int(segs[0]), int(segs[1]), int(segs[2])
     else:
         h, m, s = 0, 0, 0
 
-    # Fix overflows: if s >= 60, it was probably ms packed into s field
-    # e.g. "01:02:790" where 790 is actually ,790 not seconds
     if s >= 100:
         frac = str(s).ljust(3, "0")[:3]
         s = 0
@@ -184,6 +212,7 @@ def _ts_to_ms(ts):
 
 
 def _ms_to_ts(ms):
+    ms = max(0, ms)
     h = ms // 3600000
     ms %= 3600000
     m = ms // 60000
@@ -199,13 +228,9 @@ MAX_CHARS = 80
 def _remove_jp_spaces(text):
     JP = r"\u3000-\u9FFF\uF900-\uFAFF"
     PUNCT = r"\u3000-\u303F\uFF00-\uFFEF"
-    # Remove space before Japanese punctuation: "word 。" -> "word。"
     text = re.sub(rf"(\S) +([{PUNCT}])", r"\1\2", text)
-    # Remove space after Japanese punctuation: "。 word" -> "。word"
     text = re.sub(rf"([{PUNCT}]) +(\S)", r"\1\2", text)
-    # Remove spaces between Japanese characters: "漢字 漢字" -> "漢字漢字"
     text = re.sub(rf"([{JP}]) +([{JP}])", r"\1\2", text)
-    # Repeat to catch chains: "あ い う" needs multiple passes
     text = re.sub(rf"([{JP}]) +([{JP}])", r"\1\2", text)
     return text
 
@@ -217,17 +242,13 @@ def _try_reinterpret_ts(ts_str, target_ms):
     original_ms = h * 3600000 + m * 60000 + s * 1000 + ms
 
     candidates = [original_ms]
-    # HH:MM:SS,mmm -> treat HH as MM, MM as SS, SS+mmm as mmm
     candidates.append(h * 60000 + m * 1000 + int(f"{s}{ms:03d}"[:3]))
-    # HH:MM:SS,mmm -> just zero out HH (00:MM:SS,mmm)
     candidates.append(m * 60000 + s * 1000 + ms)
-    # Digits got concatenated: e.g. 18:52:03,496 was meant to be 00:18:52,034
-    # Try reading "HH" + first digit of MM as minutes, rest as seconds
     raw_digits = f"{h:02d}{m:02d}{s:02d}"
     for split_pt in range(1, len(raw_digits)):
         try:
             mins = int(raw_digits[:split_pt])
-            secs = int(raw_digits[split_pt:split_pt+2]) if split_pt + 2 <= len(raw_digits) else 0
+            secs = int(raw_digits[split_pt:split_pt + 2]) if split_pt + 2 <= len(raw_digits) else 0
             if mins < 60 and secs < 60:
                 candidates.append(mins * 60000 + secs * 1000 + ms)
         except ValueError:
@@ -240,7 +261,6 @@ def _try_reinterpret_ts(ts_str, target_ms):
 def _fix_timestamps(entries):
     if not entries:
         return entries
-
     fixed = []
     prev_end_ms = 0
     for start, end, text in entries:
@@ -266,7 +286,6 @@ def _fix_timestamps(entries):
 
         prev_end_ms = end_ms
         fixed.append((start, end, text))
-
     return fixed
 
 
@@ -340,27 +359,9 @@ def _fix_srt(raw):
     return "\n\n".join(result)
 
 
-def get_audio_duration(audio_path):
-    result = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
-        capture_output=True, text=True,
-    )
-    return float(result.stdout.strip())
-
-
-def split_audio_segment(audio_path, start_min, end_min):
-    tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-    tmp.close()
-    cmd = [
-        "ffmpeg", "-y", "-i", audio_path,
-        "-ss", str(start_min * 60),
-        "-to", str(end_min * 60),
-        "-c", "copy", tmp.name,
-    ]
-    subprocess.run(cmd, capture_output=True, check=True)
-    return tmp.name
-
+# ---------------------------------------------------------------------------
+# SRT offset / combine
+# ---------------------------------------------------------------------------
 
 def offset_srt(srt_text, offset_ms):
     blocks = re.split(r"\n\s*\n", srt_text.strip())
@@ -379,15 +380,38 @@ def offset_srt(srt_text, offset_ms):
     return "\n\n".join(result)
 
 
-def combine_srt(existing_srt, new_srt):
-    blocks_a = re.split(r"\n\s*\n", existing_srt.strip()) if existing_srt.strip() else []
-    blocks_b = re.split(r"\n\s*\n", new_srt.strip()) if new_srt.strip() else []
-    all_blocks = blocks_a + blocks_b
-    result = []
-    idx = 1
-    for block in all_blocks:
+def srt_time_range(srt_text):
+    if not srt_text or not srt_text.strip():
+        return None, None
+    blocks = re.split(r"\n\s*\n", srt_text.strip())
+    first_ms = None
+    last_ms = None
+    for block in blocks:
         lines = block.strip().splitlines()
         if len(lines) < 3 or "-->" not in lines[1]:
+            continue
+        start_raw, end_raw = lines[1].split("-->")
+        s = _ts_to_ms(start_raw.strip())
+        e = _ts_to_ms(end_raw.strip())
+        if first_ms is None:
+            first_ms = s
+        last_ms = e
+    return first_ms, last_ms
+
+
+def trim_srt(srt_text, keep_before_ms=None, keep_after_ms=None):
+    blocks = re.split(r"\n\s*\n", srt_text.strip())
+    result = []
+    idx = 1
+    for block in blocks:
+        lines = block.strip().splitlines()
+        if len(lines) < 3 or "-->" not in lines[1]:
+            continue
+        start_raw, end_raw = lines[1].split("-->")
+        s = _ts_to_ms(start_raw.strip())
+        if keep_before_ms is not None and s >= keep_before_ms:
+            continue
+        if keep_after_ms is not None and s < keep_after_ms:
             continue
         ts_and_text = "\n".join(lines[1:])
         result.append(f"{idx}\n{ts_and_text}")
@@ -395,53 +419,163 @@ def combine_srt(existing_srt, new_srt):
     return "\n\n".join(result)
 
 
-def transcribe_with_gemini(audio_path, api_keys, srt_mode=False, log_cb=None):
+def combine_srt(*srt_parts):
+    result = []
+    idx = 1
+    for part in srt_parts:
+        if not part or not part.strip():
+            continue
+        blocks = re.split(r"\n\s*\n", part.strip())
+        for block in blocks:
+            lines = block.strip().splitlines()
+            if len(lines) < 3 or "-->" not in lines[1]:
+                continue
+            ts_and_text = "\n".join(lines[1:])
+            result.append(f"{idx}\n{ts_and_text}")
+            idx += 1
+    return "\n\n".join(result)
+
+
+# ---------------------------------------------------------------------------
+# Gemini transcription
+# ---------------------------------------------------------------------------
+
+def _transcribe_single(audio_path, api_key, srt_mode, log_cb=None):
     prompt = PROMPT_SRT if srt_mode else PROMPT_TEXT
-    for i, key in enumerate(api_keys):
-        if log_cb:
-            log_cb(f"APIキー {i+1}/{len(api_keys)} を試行中...")
-        try:
-            client = genai.Client(api_key=key)
-            file = client.files.upload(file=audio_path)
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
-                    types.Content(
-                        parts=[
-                            types.Part.from_uri(
-                                file_uri=file.uri,
-                                mime_type=file.mime_type,
-                            ),
-                            types.Part.from_text(text=prompt),
-                        ]
-                    )
-                ],
+    client = genai.Client(api_key=api_key)
+    file = client.files.upload(file=audio_path)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[
+            types.Content(
+                parts=[
+                    types.Part.from_uri(
+                        file_uri=file.uri,
+                        mime_type=file.mime_type,
+                    ),
+                    types.Part.from_text(text=prompt),
+                ]
             )
+        ],
+    )
+    text = response.text
+    if srt_mode:
+        text = text.strip().removeprefix("```srt").removeprefix("```").removesuffix("```").strip()
+        text = _fix_srt(text)
+    return text
+
+
+def transcribe_with_fallback(audio_path, free_keys, paid_key, srt_mode, log_cb=None):
+    keys_to_try = list(free_keys)
+    if paid_key:
+        keys_to_try.append(paid_key)
+    for i, key in enumerate(keys_to_try):
+        is_paid = (paid_key and key == paid_key)
+        label = "PAID" if is_paid else f"FREE-{i+1}"
+        if log_cb:
+            log_cb(f"  key {label} を試行中...")
+        try:
+            text = _transcribe_single(audio_path, key, srt_mode, log_cb)
             if log_cb:
-                log_cb(f"APIキー {i+1} で成功")
-            text = response.text
-            if srt_mode:
-                text = text.strip().removeprefix("```srt").removeprefix("```").removesuffix("```").strip()
-                if log_cb:
-                    log_cb("SRT後処理中（タイムスタンプ修正 + 長文分割）...")
-                text = _fix_srt(text)
+                log_cb(f"  key {label} 成功")
             return text
         except Exception as e:
-            err = str(e)
             if log_cb:
-                log_cb(f"APIキー {i+1} 失敗: {err}")
-            if i == len(api_keys) - 1:
-                raise RuntimeError(f"全てのAPIキーが失敗しました。最後のエラー: {err}")
-            continue
+                log_cb(f"  key {label} 失敗: {e}")
+            if i == len(keys_to_try) - 1:
+                raise
+    raise RuntimeError("No API keys available")
 
+
+def transcribe_parallel(audio_path, free_keys, paid_key, srt_mode,
+                        range_start_min, range_end_min, batch_min, log_cb=None):
+    segments = []
+    t = range_start_min
+    while t < range_end_min:
+        seg_end = min(t + batch_min, range_end_min)
+        segments.append((t, seg_end))
+        t = seg_end
+
+    if log_cb:
+        log_cb(f"Parallel: {len(segments)} segments, {len(free_keys)} free keys")
+
+    tmp_files = []
+    for start, end in segments:
+        if start == 0 and end * 60 >= get_audio_duration(audio_path):
+            tmp_files.append(audio_path)
+        else:
+            tmp_files.append(split_audio_segment(audio_path, start, end))
+
+    results = [None] * len(segments)
+    errors = [None] * len(segments)
+
+    def worker(seg_idx, audio_file, assigned_key):
+        start_min, end_min = segments[seg_idx]
+        tag = f"[{start_min:02d}:00-{end_min:02d}:00]"
+        if log_cb:
+            log_cb(f"{tag} transcribing...")
+        try:
+            text = _transcribe_single(audio_file, assigned_key, srt_mode, log_cb)
+            results[seg_idx] = text
+            if log_cb:
+                log_cb(f"{tag} done")
+        except Exception as e:
+            if log_cb:
+                log_cb(f"{tag} key failed: {e}, trying fallback...")
+            remaining_keys = [k for k in (free_keys + ([paid_key] if paid_key else []))
+                              if k != assigned_key]
+            for fallback in remaining_keys:
+                try:
+                    text = _transcribe_single(audio_file, fallback, srt_mode, log_cb)
+                    results[seg_idx] = text
+                    if log_cb:
+                        log_cb(f"{tag} fallback succeeded")
+                    return
+                except Exception:
+                    continue
+            errors[seg_idx] = str(e)
+            if log_cb:
+                log_cb(f"{tag} all keys failed")
+
+    with ThreadPoolExecutor(max_workers=len(free_keys) or 1) as pool:
+        futures = []
+        for i in range(len(segments)):
+            key = free_keys[i % len(free_keys)] if free_keys else paid_key
+            futures.append(pool.submit(worker, i, tmp_files[i], key))
+        for f in as_completed(futures):
+            f.result()
+
+    for tmp in tmp_files:
+        if tmp != audio_path and os.path.exists(tmp):
+            os.unlink(tmp)
+
+    failed = [i for i, e in enumerate(errors) if e is not None]
+    if failed:
+        labels = [f"{segments[i][0]:02d}:00-{segments[i][1]:02d}:00" for i in failed]
+        raise RuntimeError(f"Failed segments: {', '.join(labels)}")
+
+    if srt_mode:
+        offset_results = []
+        for i, (start_min, _) in enumerate(segments):
+            text = results[i]
+            if start_min > 0:
+                text = offset_srt(text, start_min * 60 * 1000)
+            offset_results.append(text)
+        return combine_srt(*offset_results)
+    else:
+        return "\n\n".join(r for r in results if r)
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Podcast to Text")
-        self.geometry("750x600")
+        self.geometry("780x650")
         self.resizable(True, True)
-
         self._build_ui()
 
     def _build_ui(self):
@@ -472,31 +606,53 @@ class App(tk.Tk):
             side="right", **pad
         )
 
-        # --- segment selection ---
-        seg_frame = ttk.LabelFrame(self, text="Segment")
-        seg_frame.pack(fill="x", **pad)
+        # --- range & parallel ---
+        range_frame = ttk.LabelFrame(self, text="2. Range & Mode")
+        range_frame.pack(fill="x", **pad)
 
-        self.segment_var = tk.StringVar(value="Full")
-        self.segment_combo = ttk.Combobox(
-            seg_frame, textvariable=self.segment_var,
-            values=["Full"], state="readonly", width=20,
+        ttk.Label(range_frame, text="From (min):").pack(side="left", **pad)
+        self.range_from = tk.IntVar(value=0)
+        ttk.Spinbox(range_frame, from_=0, to=999, width=5,
+                     textvariable=self.range_from).pack(side="left", **pad)
+
+        ttk.Label(range_frame, text="To (min):").pack(side="left", **pad)
+        self.range_to = tk.IntVar(value=0)
+        self.range_to_spin = ttk.Spinbox(range_frame, from_=0, to=999, width=5,
+                                          textvariable=self.range_to)
+        self.range_to_spin.pack(side="left", **pad)
+
+        ttk.Button(range_frame, text="Detect", command=self._on_detect).pack(
+            side="left", **pad
         )
-        self.segment_combo.pack(side="left", **pad)
 
-        ttk.Button(
-            seg_frame, text="Detect segments", command=self._on_detect_segments
+        ttk.Separator(range_frame, orient="vertical").pack(side="left", fill="y", padx=4)
+
+        ttk.Label(range_frame, text="Batch (min):").pack(side="left", **pad)
+        self.batch_min = tk.IntVar(value=DEFAULT_BATCH_MIN)
+        ttk.Spinbox(range_frame, from_=1, to=60, width=4,
+                     textvariable=self.batch_min).pack(side="left", **pad)
+
+        self.parallel_var = tk.BooleanVar()
+        ttk.Checkbutton(
+            range_frame, text="Parallel", variable=self.parallel_var
         ).pack(side="left", **pad)
 
-        ttk.Separator(seg_frame, orient="vertical").pack(side="left", fill="y", padx=4)
+        # --- previous SRT ---
+        srt_import_frame = ttk.LabelFrame(self, text="Import previous SRT (optional, for combining)")
+        srt_import_frame.pack(fill="x", **pad)
 
         self.prev_srt_var = tk.StringVar()
-        ttk.Label(seg_frame, text="Previous SRT:").pack(side="left", **pad)
-        ttk.Entry(seg_frame, textvariable=self.prev_srt_var, width=30).pack(
+        ttk.Entry(srt_import_frame, textvariable=self.prev_srt_var).pack(
             side="left", fill="x", expand=True, **pad
         )
-        ttk.Button(
-            seg_frame, text="Browse", command=self._browse_prev_srt
-        ).pack(side="right", **pad)
+        ttk.Button(srt_import_frame, text="Browse",
+                    command=self._browse_prev_srt).pack(side="right", **pad)
+        ttk.Button(srt_import_frame, text="Clear",
+                    command=self._clear_prev_srt).pack(side="right", **pad)
+
+        self.prev_srt_info = tk.StringVar(value="")
+        ttk.Label(srt_import_frame, textvariable=self.prev_srt_info,
+                  foreground="blue").pack(side="left", **pad)
 
         # --- progress ---
         self.progress = ttk.Progressbar(self, mode="determinate")
@@ -508,7 +664,7 @@ class App(tk.Tk):
 
         self.srt_var = tk.BooleanVar()
         ttk.Checkbutton(
-            action_frame, text="SRT format (with timestamps)", variable=self.srt_var
+            action_frame, text="SRT format", variable=self.srt_var
         ).pack(side="left", **pad)
 
         self.transcribe_btn = ttk.Button(
@@ -522,18 +678,18 @@ class App(tk.Tk):
         self.save_btn.pack(side="left", **pad)
 
         # --- log / output ---
-        self.log = scrolledtext.ScrolledText(self, height=6, state="disabled")
-        self.log.pack(fill="x", **pad)
+        self.log_widget = scrolledtext.ScrolledText(self, height=8, state="disabled")
+        self.log_widget.pack(fill="x", **pad)
 
         ttk.Label(self, text="Transcript:").pack(anchor="w", **pad)
         self.output = scrolledtext.ScrolledText(self, wrap="word")
         self.output.pack(fill="both", expand=True, **pad)
 
     def _log(self, msg):
-        self.log.configure(state="normal")
-        self.log.insert("end", msg + "\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
+        self.log_widget.configure(state="normal")
+        self.log_widget.insert("end", msg + "\n")
+        self.log_widget.see("end")
+        self.log_widget.configure(state="disabled")
 
     def _set_progress(self, frac):
         self.progress["value"] = frac * 100
@@ -547,26 +703,38 @@ class App(tk.Tk):
         p = filedialog.askopenfilename(filetypes=[("SRT", "*.srt")])
         if p:
             self.prev_srt_var.set(p)
+            try:
+                text = Path(p).read_text(encoding="utf-8")
+                first_ms, last_ms = srt_time_range(text)
+                if first_ms is not None and last_ms is not None:
+                    n_entries = len([b for b in re.split(r"\n\s*\n", text.strip())
+                                    if "-->" in b])
+                    self.prev_srt_info.set(
+                        f"Covers {_ms_to_ts(first_ms)[:8]} - {_ms_to_ts(last_ms)[:8]}  "
+                        f"({n_entries} entries)"
+                    )
+                else:
+                    self.prev_srt_info.set("(empty or invalid SRT)")
+            except Exception:
+                self.prev_srt_info.set("(could not read file)")
 
-    def _on_detect_segments(self):
+    def _clear_prev_srt(self):
+        self.prev_srt_var.set("")
+        self.prev_srt_info.set("")
+
+    def _on_detect(self):
         audio = self.file_var.get().strip()
         if not audio or not os.path.isfile(audio):
             messagebox.showwarning("Input", "MP3ファイルを先に選択してください")
             return
         try:
             dur = get_audio_duration(audio)
-            total_min = dur / 60
-            segs = ["Full"]
-            start = 0
-            while start < total_min:
-                end = min(start + SEGMENT_MINUTES, int(total_min) + 1)
-                segs.append(f"{start:02d}:00 - {end:02d}:00")
-                start += SEGMENT_MINUTES
-            self.segment_combo["values"] = segs
-            self.segment_var.set("Full")
-            self._log(f"Audio: {dur:.0f}s ({total_min:.1f}min) - {len(segs)-1} segments")
+            total_min = int(dur / 60) + 1
+            self.range_from.set(0)
+            self.range_to.set(total_min)
+            self._log(f"Audio: {dur:.0f}s ({dur/60:.1f}min) | Range set to 0-{total_min}")
         except Exception as e:
-            self._log(f"Segment detection error: {e}")
+            self._log(f"Detect error: {e}")
 
     def _on_download(self):
         url = self.url_var.get().strip()
@@ -582,11 +750,9 @@ class App(tk.Tk):
             audio_url, title = resolve_podcast_audio(url)
             safe_title = re.sub(r'[\\/*?:"<>|]', "_", title)[:80]
             dest = str(Path(__file__).parent / f"{safe_title}.mp3")
-
             self.after(0, self._log, f"ダウンロード中: {title}")
             download_audio(
-                audio_url,
-                dest,
+                audio_url, dest,
                 progress_cb=lambda f: self.after(0, self._set_progress, f),
             )
             self.after(0, self.file_var.set, dest)
@@ -602,54 +768,91 @@ class App(tk.Tk):
         if not audio or not os.path.isfile(audio):
             messagebox.showwarning("Input", "MP3ファイルを選択またはダウンロードしてください")
             return
-        keys = get_api_keys()
-        if not keys or keys[0].startswith("your-key"):
+        free_keys, paid_key = get_api_keys()
+        if not free_keys and not paid_key:
             messagebox.showwarning("API Key", ".envファイルにGemini APIキーを設定してください")
             return
         self.transcribe_btn.configure(state="disabled")
         self.progress.configure(mode="indeterminate")
         self.progress.start(15)
-        srt_mode = self.srt_var.get()
-        segment = self.segment_var.get()
-        prev_srt_path = self.prev_srt_var.get().strip()
-        threading.Thread(
-            target=self._transcribe_thread,
-            args=(audio, keys, srt_mode, segment, prev_srt_path),
-            daemon=True,
-        ).start()
 
-    def _transcribe_thread(self, audio_path, keys, srt_mode, segment, prev_srt_path):
+        opts = {
+            "audio": audio,
+            "free_keys": free_keys,
+            "paid_key": paid_key,
+            "srt_mode": self.srt_var.get(),
+            "parallel": self.parallel_var.get(),
+            "range_from": self.range_from.get(),
+            "range_to": self.range_to.get(),
+            "batch_min": self.batch_min.get(),
+            "prev_srt": self.prev_srt_var.get().strip(),
+        }
+        threading.Thread(target=self._transcribe_thread, args=(opts,), daemon=True).start()
+
+    def _transcribe_thread(self, opts):
         tmp_audio = None
         try:
             log = lambda m: self.after(0, self._log, m)
-            start_min = 0
-            actual_path = audio_path
+            audio = opts["audio"]
+            free_keys = opts["free_keys"]
+            paid_key = opts["paid_key"]
+            srt_mode = opts["srt_mode"]
+            r_from = opts["range_from"]
+            r_to = opts["range_to"]
 
-            if segment != "Full":
-                match = re.match(r"(\d+):00 - (\d+):00", segment)
-                if match:
-                    start_min = int(match.group(1))
-                    end_min = int(match.group(2))
-                    log(f"Audio segment: {start_min}:00 - {end_min}:00")
-                    tmp_audio = split_audio_segment(audio_path, start_min, end_min)
-                    actual_path = tmp_audio
+            if r_to <= r_from:
+                dur = get_audio_duration(audio)
+                r_to = int(dur / 60) + 1
+                log(f"Auto-detected range: 0-{r_to} min")
 
-            text = transcribe_with_gemini(
-                actual_path, keys, srt_mode=srt_mode, log_cb=log,
-            )
+            is_full = (r_from == 0 and r_to * 60 >= get_audio_duration(audio) - 5)
 
-            if srt_mode and start_min > 0:
-                log(f"Offsetting timestamps by +{start_min}:00...")
-                text = offset_srt(text, start_min * 60 * 1000)
+            if opts["parallel"] and free_keys:
+                log(f"Parallel mode: {r_from}-{r_to} min, batch={opts['batch_min']}min, "
+                    f"{len(free_keys)} free keys" +
+                    (" + 1 paid key" if paid_key else ""))
+                text = transcribe_parallel(
+                    audio, free_keys, paid_key, srt_mode,
+                    r_from, r_to, opts["batch_min"], log_cb=log,
+                )
+            else:
+                if not is_full:
+                    log(f"Extracting segment: {r_from}:00 - {r_to}:00")
+                    tmp_audio = split_audio_segment(audio, r_from, r_to)
+                    actual = tmp_audio
+                else:
+                    actual = audio
 
-            if srt_mode and prev_srt_path and os.path.isfile(prev_srt_path):
-                log(f"Combining with previous SRT: {prev_srt_path}")
-                prev_srt = Path(prev_srt_path).read_text(encoding="utf-8")
-                text = combine_srt(prev_srt, text)
+                all_keys = free_keys + ([paid_key] if paid_key else [])
+                text = transcribe_with_fallback(
+                    actual, free_keys, paid_key, srt_mode, log_cb=log,
+                )
+
+                if srt_mode and r_from > 0:
+                    log(f"Offsetting timestamps by +{r_from}:00...")
+                    text = offset_srt(text, r_from * 60 * 1000)
+
+            prev_srt = opts["prev_srt"]
+            if srt_mode and prev_srt and os.path.isfile(prev_srt):
+                prev_text = Path(prev_srt).read_text(encoding="utf-8")
+                new_start_ms = r_from * 60 * 1000
+                new_end_ms = r_to * 60 * 1000
+                prev_first, prev_last = srt_time_range(prev_text)
+                if prev_first is not None and prev_last is not None:
+                    if prev_first < new_end_ms and prev_last > new_start_ms:
+                        overlap_start = _ms_to_ts(max(prev_first, new_start_ms))[:8]
+                        overlap_end = _ms_to_ts(min(prev_last, new_end_ms))[:8]
+                        log(f"Overlap detected ({overlap_start}-{overlap_end}), "
+                            f"trimming previous SRT to keep only entries before {_ms_to_ts(new_start_ms)[:8]}")
+                        prev_text = trim_srt(prev_text, keep_before_ms=new_start_ms)
+                    else:
+                        log("No overlap, combining as-is")
+                log(f"Combining with previous SRT...")
+                text = combine_srt(prev_text, text)
 
             self.after(0, self._show_transcript, text)
         except Exception as e:
-            self.after(0, self._log, f"文字起こしエラー: {e}")
+            self.after(0, self._log, f"エラー: {e}")
         finally:
             if tmp_audio and os.path.exists(tmp_audio):
                 os.unlink(tmp_audio)
